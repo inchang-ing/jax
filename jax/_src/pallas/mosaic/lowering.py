@@ -1751,7 +1751,9 @@ def _compute_name_stack_updates(
 
 
 def jaxpr_subcomp(
-    ctx: LoweringContext, jaxpr: jax_core.Jaxpr, *args: ir.Value | AccRef
+    ctx: LoweringContext,
+    jaxpr: jax_core.Jaxpr,
+    *args: ir.Value | AccRef | KeyScalarBundle,
 ) -> list[ir.Value]:
   assert not jaxpr.constvars
   env = {}
@@ -2263,6 +2265,12 @@ def _transform_ref(ref, ref_ty, ref_block_shape, transforms=()):
   return ref, ref_block_shape
 
 
+@functools.partial(
+    tree_util.register_dataclass,
+    data_fields=["scalars"],
+    meta_fields=["key_shape"],
+    registry=ft.tracing_registry,
+)
 @dataclasses.dataclass(frozen=True)
 class KeyScalarBundle:
   """A container class for PRNG key data.
@@ -2278,7 +2286,7 @@ class KeyScalarBundle:
       lowering pass.
   """
   key_shape: tuple[int, ...]
-  scalars: Sequence[ir.OpResult]
+  scalars: Sequence[Any]
 
 def _canonicalize_transforms_to_indexer(
       ref_aval,
@@ -4436,10 +4444,13 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
       is_static_start and is_static_steps and num_steps == unroll
   )
   supports_late_unroll = not ctx.forward_compatible
+  consts_ft = ft.flatten(consts)
+  args_ft = ft.flatten(list(args))
+  flat_args = args_ft.vals
   # TODO(apaszke): Remove forward_compatible check and associated code after 20.08.2026
   if unroll > 1 and (is_full_static_unroll or not supports_late_unroll):
-    const_types = [val.type for val in consts]
-    args_types = [val.type for val in args]
+    const_types = [val.type for val in consts_ft.vals]
+    args_types = [val.type for val in flat_args]
 
     user_grid_indices = ctx.lowering_context.user_grid_indices
     has_grid = user_grid_indices is not None
@@ -4454,18 +4465,27 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
     func_arg_types.extend(args_types)
 
     def body_builder(block_args: list[ir.Value]) -> list[ir.Value]:
-      if has_grid:
-        block_grid_indices = block_args[:grid_arity]
-        block_rest = block_args[grid_arity:]
-      else:
-        block_grid_indices = None
-        block_rest = block_args
+      (
+          block_grid_indices,
+          block_consts,
+          block_loop_index,
+          block_args,
+      ) = split_list(
+          block_args, [grid_arity, len(consts_ft.vals), int(has_loop_index)]
+      )
 
       lowering_context = ctx.lowering_context.replace(
           block_shapes=ctx.block_shapes,
-          user_grid_indices=block_grid_indices,
+          user_grid_indices=block_grid_indices if has_grid else None,
       )
-      return jaxpr_subcomp(lowering_context, jaxpr, *block_rest)
+      outs = jaxpr_subcomp(
+          lowering_context,
+          jaxpr,
+          *consts_ft.update(block_consts).unflatten(),
+          *block_loop_index,
+          *args_ft.update(block_args).unflatten(),
+      )
+      return ft.flatten(outs).vals
 
     func_op = _emit_detached_func(
         "_unrolled_loop_body",
@@ -4474,33 +4494,38 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
         body_builder
     )
 
-    def _run_body(i, args):
+    def _run_body(i, flat_args):
       call_args = []
       if has_grid:
         call_args.extend(user_grid_indices)
-      call_args.extend(consts)
+      call_args.extend(consts_ft.vals)
       if has_loop_index:
         call_args.append(i)
-      call_args.extend(args)
+      call_args.extend(flat_args)
       outs = jax_mlir_ext.inlined_func_call(func_op.operation, call_args)
       return outs
   else:
-    def _run_body(i, args):
+    def _run_body(i, flat_args):
       lowering_context = ctx.lowering_context.replace(
           block_shapes=ctx.block_shapes)
+      unflattened_args = args_ft.update(flat_args).unflatten()
       if has_loop_index:
-        args = jaxpr_subcomp(lowering_context, jaxpr, *consts, i, *args)
+        outs = jaxpr_subcomp(
+            lowering_context, jaxpr, *consts, i, *unflattened_args
+        )
       else:
-        args = jaxpr_subcomp(lowering_context, jaxpr, *consts, *args)
-      return args
+        outs = jaxpr_subcomp(
+            lowering_context, jaxpr, *consts, *unflattened_args
+        )
+      return ft.flatten(outs).vals
 
   if is_full_static_unroll:
     # No need for an scf.For. We can just unroll completely
     for i in range(start, start + num_steps):
-      args = _run_body(
-          ir_constant(i, mlir_type=_dtype_to_ir_type(jnp.int32)), args
+      flat_args = _run_body(
+          ir_constant(i, mlir_type=_dtype_to_ir_type(jnp.int32)), flat_args
       )
-    return args
+    return args_ft.update(flat_args).unflatten()
 
   lbd = _ensure_mlir_value(start, pallas_core.index_map_grid_aval)
   remainder = 0
@@ -4550,7 +4575,7 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
 
   if has_main:
     step_val = ir_constant(unroll, mlir_type=_dtype_to_ir_type(jnp.int32))
-    main_for_op = scf.ForOp(lbd, main_ubd, step_val, args)
+    main_for_op = scf.ForOp(lbd, main_ubd, step_val, flat_args)
     if unroll_attr is not None:
       main_for_op.attributes["tpu.late_unroll"] = unroll_attr
     with ir.InsertionPoint(main_for_op.body):
@@ -4568,7 +4593,7 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
           )
         loop_args = _run_body(actual_i, loop_args)
       scf.yield_(loop_args)
-    args = main_for_op.results
+    flat_args = main_for_op.results
 
   if has_static_remainder:
     for i in range(remainder):
@@ -4578,19 +4603,19 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
               main_range + i, mlir_type=_dtype_to_ir_type(jnp.int32)
           ),
       )
-      args = _run_body(actual_i, args)
+      flat_args = _run_body(actual_i, flat_args)
 
   elif has_dynamic_remainder:
     one_val = ir_constant(1, mlir_type=_dtype_to_ir_type(jnp.int32))
-    rem_for_op = scf.ForOp(main_ubd, ubd, one_val, args)
+    rem_for_op = scf.ForOp(main_ubd, ubd, one_val, flat_args)
     with ir.InsertionPoint(rem_for_op.body):
       iv = rem_for_op.induction_variable
       inner_args = rem_for_op.inner_iter_args
       inner_out = _run_body(iv, inner_args)
       scf.yield_(inner_out)
-    args = rem_for_op.results
+    flat_args = rem_for_op.results
 
-  return args
+  return args_ft.update(flat_args).unflatten()
 
 
 @register_lowering_rule(
@@ -4697,12 +4722,16 @@ def _while_lowering_rule(
   cond_const_block_shapes, body_const_block_shapes, carry_block_shapes = (
       split_list(ctx.block_shapes, [cond_nconsts, body_nconsts])
   )
-  carry_types = [a.type for a in carry]
-  while_op = scf.WhileOp(carry_types, carry)
+  carry_ft = ft.flatten(carry)
+  carry_types = [a.type for a in carry_ft.vals]
+  while_op = scf.WhileOp(carry_types, carry_ft.vals)
 
   before_block = while_op.before.blocks.append(*carry_types)
   with ir.InsertionPoint.at_block_begin(before_block):
-    cond_args = [*cond_consts, *before_block.arguments]
+    cond_args = [
+        *cond_consts,
+        *carry_ft.update(before_block.arguments).unflatten(),
+    ]
     [cond] = jaxpr_subcomp(
         ctx.lowering_context.replace(
             block_shapes=[*cond_const_block_shapes, *carry_block_shapes]
@@ -4714,7 +4743,10 @@ def _while_lowering_rule(
 
   after_block = while_op.after.blocks.append(*carry_types)
   with ir.InsertionPoint.at_block_begin(after_block):
-    body_args = [*body_consts, *after_block.arguments]
+    body_args = [
+        *body_consts,
+        *carry_ft.update(after_block.arguments).unflatten(),
+    ]
     loop_out = jaxpr_subcomp(
         ctx.lowering_context.replace(
             block_shapes=[*body_const_block_shapes, *carry_block_shapes],
@@ -4722,9 +4754,10 @@ def _while_lowering_rule(
         body_jaxpr,
         *body_args,
     )
-    if loop_out:
-      scf.yield_(loop_out)
-  return list(while_op.results)
+    flat_loop_out = ft.flatten(loop_out).vals
+    if flat_loop_out:
+      scf.yield_(flat_loop_out)
+  return carry_ft.update(while_op.results).unflatten()
 
 
 @register_lowering_rule(lax.cond_p, kernel_types=[*tpu_core.CoreType])
@@ -5711,6 +5744,19 @@ def random_bits_lowering(ctx: LoweringRuleContext, keys, *, bit_width, shape):
   aval, = ctx.avals_in
   assert isinstance(aval.dtype, prng.KeyTy)
   impl = aval.dtype._impl
+  if isinstance(keys, KeyScalarBundle):
+    def _pallas_bits(key: KeyScalarBundle, bit_width, shape):
+      key = pl_random.wrap_pallas_seed(*key.scalars, impl=impl)
+      return impl.random_bits(key, bit_width, shape)
+    in_avals = (
+        KeyScalarBundle(
+            scalars=[jax_core.ShapedArray((), jnp.uint32)] * len(keys.scalars),
+            key_shape=keys.key_shape,
+        ),
+    )
+    return lower_fun(_pallas_bits, in_avals=in_avals)(
+        ctx, keys, bit_width=bit_width, shape=shape
+    )
   _proxy_fn = impl.random_bits
   if not pl_random.is_pallas_impl(impl):
     def new_lowering(key, bit_width, shape):
@@ -5726,14 +5772,25 @@ def random_fold_in_lowering(ctx: LoweringRuleContext, keys, msgs):
   keys_aval, msgs_aval = ctx.avals_in
   assert isinstance(keys_aval.dtype, prng.KeyTy)
   impl = keys_aval.dtype._impl
-  fold_in_lowering = lower_fun(impl.fold_in)
   if pl_random.is_pallas_impl(impl):
-    return fold_in_lowering(ctx, keys, msgs)
+    assert isinstance(keys, KeyScalarBundle)
+    def _pallas_fold_in(key: KeyScalarBundle, msgs):
+      key = pl_random.wrap_pallas_seed(*key.scalars, impl=impl)
+      return pl_random.unwrap_pallas_seed(impl.fold_in(key, msgs))
+    in_avals = (
+        KeyScalarBundle(
+            scalars=[jax_core.ShapedArray((), jnp.uint32)] * len(keys.scalars),
+            key_shape=keys.key_shape,
+        ),
+        msgs_aval,
+    )
+    out_scalars = lower_fun(_pallas_fold_in, in_avals=in_avals)(ctx, keys, msgs)
+    return KeyScalarBundle(scalars=out_scalars, key_shape=keys.key_shape)
   else:
     ctx = dataclasses.replace(ctx,
                         avals_in=[_physical_aval(keys_aval), msgs_aval],
                         avals_out=map(_physical_aval, ctx.avals_out))
-    return fold_in_lowering(ctx, keys, msgs)
+    return lower_fun(impl.fold_in)(ctx, keys, msgs)
 
 
 @register_lowering_rule(prng.random_unwrap_p)
@@ -5771,7 +5828,7 @@ def _split_key_lowering_rule(
 def _join_key_lowering_rule(ctx: LoweringRuleContext, *scalars, impl):
   if not pl_random.is_pallas_impl(impl):
     return ValueError(f"Can only join Pallas keys. Got impl={impl}")
-  return KeyScalarBundle(scalars=scalars, key_shape=tuple(impl.key_shape))
+  return KeyScalarBundle(scalars=list(scalars), key_shape=tuple(impl.key_shape))
 
 
 @register_lowering_rule(checkify.check_p, kernel_types=[*tpu_core.CoreType])
@@ -5937,6 +5994,7 @@ def _matmul_push_rhs_lowering_rule(
   return []
 
 
+@functools.partial(tree_util.register_static, registry=ft.tracing_registry)
 @dataclasses.dataclass(frozen=True)
 class AccRef:
   # The base address of an accumulator reference is an offset in units of

@@ -261,6 +261,8 @@ def register_pytree_node(
     flatten_with_keys_func: (
         Callable[[T], tuple[KeyLeafPairs, _AuxData]] | None
     ) = None,
+    *,
+    registry: pytree.PyTreeRegistry | None = None,
 ) -> None:
   """Extends the set of types that are considered internal nodes in pytrees.
 
@@ -326,8 +328,9 @@ def register_pytree_node(
     >>> jax.jit(f)(m)
     Array([1., 2., 3., 4., 5.], dtype=float32)
   """
-  for registry in _all_registries:
-    registry.register_node(
+  registries = _all_registries if registry is None else (registry,)
+  for reg in registries:
+    reg.register_node(
         nodetype, flatten_func, unflatten_func, flatten_with_keys_func
     )
   _registry[nodetype] = _RegistryEntry(flatten_func, unflatten_func)
@@ -891,6 +894,8 @@ def register_pytree_with_keys(
     flatten_with_keys: Callable[[T], tuple[Iterable[KeyLeafPair], _AuxData]],
     unflatten_func: Callable[[_AuxData, Iterable[Any]], T],
     flatten_func: None | (Callable[[T], tuple[Iterable[Any], _AuxData]]) = None,
+    *,
+    registry: pytree.PyTreeRegistry | None = None,
 ):
   """Extends the set of types that are considered internal nodes in pytrees.
 
@@ -952,7 +957,11 @@ def register_pytree_with_keys(
     flatten_func = flatten_func_impl
 
   register_pytree_node(
-      nodetype, flatten_func, unflatten_func, flatten_with_keys
+      nodetype,
+      flatten_func,
+      unflatten_func,
+      flatten_with_keys,
+      registry=registry,
   )
 
 
@@ -1011,6 +1020,8 @@ def register_dataclass(
     data_fields: Sequence[str] | None = None,
     meta_fields: Sequence[str] | None = None,
     drop_fields: Sequence[str] = (),
+    *,
+    registry: pytree.PyTreeRegistry | None = None,
 ) -> Typ:
   """Extends the set of types that are considered internal nodes in pytrees.
 
@@ -1173,8 +1184,9 @@ def register_dataclass(
     data = tuple(getattr(x, name) for name in data_fields)
     return data, meta
 
-  for registry in _all_registries:
-    registry.register_dataclass_node(nodetype, list(data_fields), list(meta_fields))
+  registries = _all_registries if registry is None else (registry,)
+  for reg in registries:
+    reg.register_dataclass_node(nodetype, list(data_fields), list(meta_fields))
   _registry[nodetype] = _RegistryEntry(flatten_func, unflatten_func)
   return nodetype
 
@@ -1197,7 +1209,11 @@ register_pytree_with_keys(
 
 
 @export
-def register_static(cls: type[H]) -> type[H]:
+def register_static(
+    cls: type[H],
+    *,
+    registry: pytree.PyTreeRegistry | None = None,
+) -> type[H]:
   """Registers `cls` as a pytree with no leaves.
 
   Instances are treated as static by :func:`jax.jit`, :func:`jax.pmap`, etc. This can
@@ -1230,7 +1246,7 @@ def register_static(cls: type[H]) -> type[H]:
   """
   flatten = lambda obj: ((), obj)
   unflatten = lambda obj, empty_iter_children: obj
-  register_pytree_with_keys(cls, flatten, unflatten)
+  register_pytree_with_keys(cls, flatten, unflatten, registry=registry)
   return cls
 
 
